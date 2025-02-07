@@ -7,11 +7,24 @@ use log::{debug, error, info};
 use reqwest::Client;
 use rmp_serde::Deserializer;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+
+// Avoid musl's default allocator due to lackluster performance
+// https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+lazy_static::lazy_static!(
+    static ref SYNC_HOST: String = format!(
+    "http://{}/v1/traces", std::env::var("ZIPKIN_COLLECTOR_HOST_PORT").unwrap_or_else(|_| "127.0.0.1:4318".to_owned()));
+    static ref BIND_TO: String = std::env::var("BIND_TO").unwrap_or_else(|_| "127.0.0.1:8126".to_owned());
+);
 
 #[derive(Debug, Deserialize)]
 struct DDTrace {
@@ -24,6 +37,7 @@ struct DDTrace {
     service: String,
     resource: String,
     meta: std::collections::HashMap<String, String>,
+    error: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -45,8 +59,19 @@ struct OTelKeyValue {
 }
 
 #[derive(Debug, Serialize, Clone)]
-struct OTelAnyValue {
-    string_value: Option<String>,
+#[serde(untagged)]
+enum OTelAnyValue {
+    String { string_value: String },
+    Bool { bool_value: bool },
+}
+impl OTelAnyValue {
+    fn string_value(&self) -> Option<&String> {
+        if let OTelAnyValue::String { string_value } = self {
+            Some(string_value)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -102,21 +127,27 @@ fn dd2otel(dd_trace: &DDTrace) -> OTelSpan {
     for (key, value) in &dd_trace.meta {
         attributes.push(OTelKeyValue {
             key: key.clone(),
-            value: OTelAnyValue {
-                string_value: Some(value.clone()),
+            value: OTelAnyValue::String {
+                string_value: value.clone(),
             },
         });
     }
     attributes.push(OTelKeyValue {
         key: "resource".to_string(),
-        value: OTelAnyValue {
-            string_value: Some(dd_trace.resource.clone()),
+        value: OTelAnyValue::String {
+            string_value: dd_trace.resource.clone(),
         },
     });
     attributes.push(OTelKeyValue {
         key: "service.name".to_string(),
-        value: OTelAnyValue {
-            string_value: Some(dd_trace.service.clone()),
+        value: OTelAnyValue::String {
+            string_value: dd_trace.service.clone(),
+        },
+    });
+    attributes.push(OTelKeyValue {
+        key: "error".to_string(),
+        value: OTelAnyValue::Bool {
+            bool_value: dd_trace.error == 1,
         },
     });
 
@@ -134,7 +165,7 @@ fn dd2otel(dd_trace: &DDTrace) -> OTelSpan {
         end_time_unix_nano: (dd_trace.start + dd_trace.duration),
         attributes,
     };
-    dbg!(dd_trace, &conv);
+    debug!("{:#?} -> {:#?}", dd_trace, &conv);
     conv
 }
 
@@ -176,7 +207,7 @@ async fn send_batch(client: &Client, spans: &[OTelSpan]) -> Result<(), AppError>
                 .iter()
                 .find(|attr| attr.key == "service.name")
         })
-        .and_then(|attr| attr.value.string_value.clone())
+        .and_then(|attr| attr.value.string_value().map(Clone::clone))
         .unwrap_or_else(|| "unknown-service".to_string());
 
     let otel_request = OTelRequest {
@@ -184,8 +215,8 @@ async fn send_batch(client: &Client, spans: &[OTelSpan]) -> Result<(), AppError>
             resource: OTelResource {
                 attributes: vec![OTelKeyValue {
                     key: "service.name".to_string(),
-                    value: OTelAnyValue {
-                        string_value: Some(service_name),
+                    value: OTelAnyValue::String {
+                        string_value: service_name,
                     },
                 }],
             },
@@ -200,7 +231,7 @@ async fn send_batch(client: &Client, spans: &[OTelSpan]) -> Result<(), AppError>
     };
 
     let response = client
-        .post("http://127.0.0.1:4318/v1/traces")
+        .post(SYNC_HOST.deref())
         .json(&otel_request)
         .send()
         .await?;
@@ -237,12 +268,7 @@ async fn handle_traces(
     );
     Ok(HttpResponse::Ok().finish())
 }
-fn add_error_header<B>(mut res: ServiceResponse<B>) -> actix_web::Result<ErrorHandlerResponse<B>> {
-    debug!(
-        "hey {:#?}",
-        std::any::type_name_of_val(&res.response().error())
-    );
-    // body is unchanged, map to "left" slot
+fn add_error_header<B>(res: ServiceResponse<B>) -> actix_web::Result<ErrorHandlerResponse<B>> {
     Ok(ErrorHandlerResponse::Response(res.map_into_left_body()))
 }
 
@@ -261,7 +287,7 @@ async fn main() -> std::io::Result<()> {
         send_spans(&client, spans_clone).await;
     });
 
-    info!("Starting server on 127.0.0.1:8126");
+    info!("Starting server on {} sending to {}", *BIND_TO, *SYNC_HOST);
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
@@ -274,7 +300,7 @@ async fn main() -> std::io::Result<()> {
                 Ok::<_, AppError>(HttpResponse::Ok().finish())
             }))
     })
-    .bind("127.0.0.1:8126")?
+    .bind(BIND_TO.deref())?
     .run()
     .await
 }

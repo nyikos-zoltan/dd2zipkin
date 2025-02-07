@@ -1,0 +1,9 @@
+services:
+  dd2zipkin:
+    build: .
+    ports:
+    - "8126:8126"
+    environment:
+      BIND_TO: '0.0.0.0:8126'
+      ZIPKIN_COLLECTOR_HOST_PORT: 'host.docker.internal:4318'
+      RUST_LOG: info
