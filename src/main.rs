@@ -1,3 +1,6 @@
+use actix_web::dev::ServiceResponse;
+use actix_web::middleware::{ErrorHandlerResponse, Logger};
+use actix_web::web::PayloadConfig;
 use actix_web::{web, App, HttpResponse, HttpServer, ResponseError};
 use env_logger;
 use log::{debug, error, info};
@@ -24,27 +27,58 @@ struct DDTrace {
 }
 
 #[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct ZipkinSpan {
-    id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parent_id: Option<String>,
+struct OTelSpan {
     trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
     name: String,
-    timestamp: u64,
-    duration: u64,
-    local_endpoint: LocalEndpoint,
-    tags: std::collections::HashMap<String, String>,
+    kind: i32, // 1 for INTERNAL
+    start_time_unix_nano: u64,
+    end_time_unix_nano: u64,
+    attributes: Vec<OTelKeyValue>,
 }
 
 #[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct LocalEndpoint {
-    service_name: String,
+struct OTelKeyValue {
+    key: String,
+    value: OTelAnyValue,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct OTelAnyValue {
+    string_value: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OTelRequest {
+    resource_spans: Vec<OTelResourceSpans>,
+}
+
+#[derive(Debug, Serialize)]
+struct OTelResourceSpans {
+    resource: OTelResource,
+    scope_spans: Vec<OTelScopeSpans>,
+}
+
+#[derive(Debug, Serialize)]
+struct OTelResource {
+    attributes: Vec<OTelKeyValue>,
+}
+
+#[derive(Debug, Serialize)]
+struct OTelScopeSpans {
+    scope: OTelInstrumentationScope,
+    spans: Vec<OTelSpan>,
+}
+
+#[derive(Debug, Serialize)]
+struct OTelInstrumentationScope {
+    name: String,
+    version: String,
 }
 
 struct AppState {
-    spans: Arc<Mutex<Vec<ZipkinSpan>>>,
+    spans: Arc<Mutex<Vec<OTelSpan>>>,
 }
 
 #[derive(Error, Debug)]
@@ -53,8 +87,8 @@ enum AppError {
     DeserializationError(#[from] rmp_serde::decode::Error),
     #[error("Failed to send spans: {0}")]
     SendError(#[from] reqwest::Error),
-    #[error("Zipkin API error: Status {0}, Body: {1}")]
-    ZipkinApiError(u16, String),
+    #[error("OpenTelemetry API error: Status {0}, Body: {1}")]
+    OTelApiError(u16, String),
 }
 
 impl ResponseError for AppError {
@@ -63,38 +97,57 @@ impl ResponseError for AppError {
     }
 }
 
-fn dd2zipkin(dd_trace: &DDTrace) -> ZipkinSpan {
-    let mut tags = dd_trace.meta.clone();
-    tags.insert("resource".to_string(), dd_trace.resource.clone());
+fn dd2otel(dd_trace: &DDTrace) -> OTelSpan {
+    let mut attributes = Vec::new();
+    for (key, value) in &dd_trace.meta {
+        attributes.push(OTelKeyValue {
+            key: key.clone(),
+            value: OTelAnyValue {
+                string_value: Some(value.clone()),
+            },
+        });
+    }
+    attributes.push(OTelKeyValue {
+        key: "resource".to_string(),
+        value: OTelAnyValue {
+            string_value: Some(dd_trace.resource.clone()),
+        },
+    });
+    attributes.push(OTelKeyValue {
+        key: "service.name".to_string(),
+        value: OTelAnyValue {
+            string_value: Some(dd_trace.service.clone()),
+        },
+    });
 
-    ZipkinSpan {
-        id: format!("{:016x}", dd_trace.span_id),
-        parent_id: if dd_trace.parent_id != 0 {
+    let conv = OTelSpan {
+        trace_id: format!("{:032x}", dd_trace.trace_id),
+        span_id: format!("{:016x}", dd_trace.span_id),
+        parent_span_id: if dd_trace.parent_id != 0 {
             Some(format!("{:016x}", dd_trace.parent_id))
         } else {
             None
         },
-        trace_id: format!("{:016x}", dd_trace.trace_id),
         name: dd_trace.name.clone(),
-        timestamp: dd_trace.start / 1000,
-        duration: dd_trace.duration / 1000,
-        local_endpoint: LocalEndpoint {
-            service_name: dd_trace.service.clone(),
-        },
-        tags,
-    }
+        kind: 1, // INTERNAL
+        start_time_unix_nano: (dd_trace.start),
+        end_time_unix_nano: (dd_trace.start + dd_trace.duration),
+        attributes,
+    };
+    dbg!(dd_trace, &conv);
+    conv
 }
 
-async fn send_spans(client: &Client, spans: Arc<Mutex<Vec<ZipkinSpan>>>) {
+async fn send_spans(client: &Client, spans: Arc<Mutex<Vec<OTelSpan>>>) {
     loop {
-        let to_send: Vec<ZipkinSpan> = {
+        let to_send: Vec<OTelSpan> = {
             let mut spans = spans.lock().await;
             let count = std::cmp::min(10, spans.len());
             spans.drain(..count).collect()
         };
 
         if !to_send.is_empty() {
-            debug!("Attempting to send spans: {:#?}", &to_send);
+            // debug!("Attempting to send spans: {:#?}", &to_send);
             match send_batch(&client, &to_send).await {
                 Ok(_) => {
                     info!("Successfully sent {} spans", to_send.len());
@@ -115,10 +168,40 @@ async fn send_spans(client: &Client, spans: Arc<Mutex<Vec<ZipkinSpan>>>) {
     }
 }
 
-async fn send_batch(client: &Client, spans: &[ZipkinSpan]) -> Result<(), AppError> {
+async fn send_batch(client: &Client, spans: &[OTelSpan]) -> Result<(), AppError> {
+    let service_name = spans
+        .first()
+        .and_then(|span| {
+            span.attributes
+                .iter()
+                .find(|attr| attr.key == "service.name")
+        })
+        .and_then(|attr| attr.value.string_value.clone())
+        .unwrap_or_else(|| "unknown-service".to_string());
+
+    let otel_request = OTelRequest {
+        resource_spans: vec![OTelResourceSpans {
+            resource: OTelResource {
+                attributes: vec![OTelKeyValue {
+                    key: "service.name".to_string(),
+                    value: OTelAnyValue {
+                        string_value: Some(service_name),
+                    },
+                }],
+            },
+            scope_spans: vec![OTelScopeSpans {
+                scope: OTelInstrumentationScope {
+                    name: "dd-to-otel-converter".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                spans: spans.to_vec(),
+            }],
+        }],
+    };
+
     let response = client
-        .post("http://127.0.0.1:9411/api/v2/spans")
-        .json(spans)
+        .post("http://127.0.0.1:4318/v1/traces")
+        .json(&otel_request)
         .send()
         .await?;
     let status = response.status();
@@ -126,8 +209,8 @@ async fn send_batch(client: &Client, spans: &[ZipkinSpan]) -> Result<(), AppErro
         Ok(())
     } else {
         let body = response.text().await?;
-        error!("Zipkin API error: Status {}, Body: {}", status, body);
-        Err(AppError::ZipkinApiError(status.as_u16(), body))
+        error!("OpenTelemetry API error: Status {}, Body: {}", status, body);
+        Err(AppError::OTelApiError(status.as_u16(), body))
     }
 }
 
@@ -140,19 +223,27 @@ async fn handle_traces(
     let trace_groups: Vec<Vec<DDTrace>> = Vec::deserialize(&mut deserializer)?;
 
     let trace_groups_count = trace_groups.len();
-    let zipkin_spans: Vec<ZipkinSpan> = trace_groups
+    let otel_spans: Vec<OTelSpan> = trace_groups
         .into_iter()
-        .flat_map(|group| group.into_iter().map(|trace| dd2zipkin(&trace)))
+        .flat_map(|group| group.into_iter().map(|trace| dd2otel(&trace)))
         .collect();
 
     let mut spans = data.spans.lock().await;
-    spans.extend(zipkin_spans);
+    spans.extend(otel_spans);
 
     info!(
         "Processed and converted {} trace groups",
         trace_groups_count
     );
     Ok(HttpResponse::Ok().finish())
+}
+fn add_error_header<B>(mut res: ServiceResponse<B>) -> actix_web::Result<ErrorHandlerResponse<B>> {
+    debug!(
+        "hey {:#?}",
+        std::any::type_name_of_val(&res.response().error())
+    );
+    // body is unchanged, map to "left" slot
+    Ok(ErrorHandlerResponse::Response(res.map_into_left_body()))
 }
 
 #[actix_web::main]
@@ -173,9 +264,13 @@ async fn main() -> std::io::Result<()> {
     info!("Starting server on 127.0.0.1:8126");
     HttpServer::new(move || {
         App::new()
+            .wrap(Logger::default())
+            .wrap(actix_web::middleware::ErrorHandlers::new().default_handler(add_error_header))
+            .app_data(PayloadConfig::default().limit(10_000_000))
             .app_data(app_state.clone())
             .route("/v0.4/traces", web::post().to(handle_traces))
             .default_service(web::to(|| async {
+                debug!("???");
                 Ok::<_, AppError>(HttpResponse::Ok().finish())
             }))
     })
