@@ -1,0 +1,1 @@
+{"trace_id":"00000000000000000000000000000458","span_id":"0000000000000457","parent_span_id":"0000000000000456","name":"name","kind":1,"start_time_unix_nano":1,"end_time_unix_nano":3,"attributes":[{"key":"resource","value":{"string_value":"res"}},{"key":"service.name","value":{"string_value":"svc"}},{"key":"error","value":{"bool_value":false}}]}

@@ -169,6 +169,26 @@ fn dd2otel(dd_trace: &DDTrace) -> OTelSpan {
     conv
 }
 
+#[test]
+fn test_dd2otel() {
+    let otel = dd2otel(&DDTrace {
+        span_id: 1111u64,
+        parent_id: 1110u64,
+        trace_id: 1112u64,
+        name: "name".to_owned(),
+        start: 1,
+        duration: 2,
+        service: "svc".to_owned(),
+        resource: "res".to_owned(),
+        meta: Default::default(),
+        error: 0,
+    });
+
+    let res = serde_json::ser::to_string(&otel).unwrap();
+    let snap = std::fs::read_to_string("snapshots/dd2otel.json").unwrap();
+    assert_eq!(res.trim(), snap.trim());
+}
+
 async fn send_spans(client: &Client, spans: Arc<Mutex<Vec<OTelSpan>>>) {
     loop {
         let to_send: Vec<OTelSpan> = {
