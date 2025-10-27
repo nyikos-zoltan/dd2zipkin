@@ -152,7 +152,7 @@ fn dd2otel(dd_trace: &DDTrace) -> OTelSpan {
     });
 
     let conv = OTelSpan {
-        trace_id: format!("{:032x}", dd_trace.trace_id),
+        trace_id: format!("{:016x}", dd_trace.trace_id),
         span_id: format!("{:016x}", dd_trace.span_id),
         parent_span_id: if dd_trace.parent_id != 0 {
             Some(format!("{:016x}", dd_trace.parent_id))
